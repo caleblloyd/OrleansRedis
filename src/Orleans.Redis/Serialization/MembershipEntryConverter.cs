@@ -12,12 +12,12 @@ namespace Orleans.Redis.Serialization
     {
         public override bool CanConvert(Type objectType)
         {
-            return (objectType == typeof(MembershipEntry));
+            return objectType == typeof(MembershipEntry);
         }
 
         public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
         {
-            MembershipEntry me = (MembershipEntry) value;
+            var me = (MembershipEntry) value;
             writer.WriteStartObject();
             writer.WritePropertyName("SiloAddress");
             serializer.Serialize(writer, me.SiloAddress);
@@ -41,7 +41,7 @@ namespace Orleans.Redis.Serialization
         public override object ReadJson(JsonReader reader, Type objectType, object existingValue,
             JsonSerializer serializer)
         {
-            JObject jo = JObject.Load(reader);
+            var jo = JObject.Load(reader);
             return new MembershipEntry
             {
                 SiloAddress = jo["SiloAddress"].ToObject<SiloAddress>(serializer),

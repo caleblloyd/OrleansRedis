@@ -21,16 +21,18 @@ namespace Orleans.Redis.Clustering.Messaging
         private readonly IOptions<RedisClusteringSiloOptions> _clusteringOptions;
         private readonly IDatabase _db;
         private readonly ILogger<RedisMembershipTable> _logger;
-        
-        private static readonly Lazy<JsonSerializerSettings> SerializationSettings = new Lazy<JsonSerializerSettings>(() =>
-        {
-            var settings = new JsonSerializerSettings();
-            settings.Converters.Add(new SiloAddressConverter());
-            settings.Converters.Add(new MembershipEntryConverter());
-            settings.Converters.Add(new MembershipTableDataConverter());
-            settings.Converters.Add(new StringEnumConverter());
-            return settings;
-        });
+
+        private static readonly Lazy<JsonSerializerSettings> SerializationSettings = new Lazy<JsonSerializerSettings>(
+            () =>
+            {
+                var settings = new JsonSerializerSettings();
+                settings.Converters.Add(new MembershipEntryConverter());
+                settings.Converters.Add(new MembershipTableDataConverter());
+                settings.Converters.Add(new TableVersionConverter());
+                settings.Converters.Add(new SiloAddressConverter());
+                settings.Converters.Add(new StringEnumConverter());
+                return settings;
+            });
 
         public RedisMembershipTable(
             IOptions<ClusterOptions> clusterOptions,
@@ -114,15 +116,13 @@ namespace Orleans.Redis.Clustering.Messaging
                 throw;
             }
 
-            var dataJson = result[0].ToString();
-            var aliveJson = result[1].ToString();
-            if (string.IsNullOrEmpty(dataJson) || string.IsNullOrEmpty(aliveJson))
+            if (string.IsNullOrEmpty(result[0]) || string.IsNullOrEmpty(result[1]))
             {
                 return null;
             }
 
-            var alive = JsonConvert.DeserializeObject<DateTime>(result[0].ToString(), SerializationSettings.Value);
-            var data = JsonConvert.DeserializeObject<MembershipTableData>(result[1].ToString(), SerializationSettings.Value);
+            var data = JsonConvert.DeserializeObject<MembershipTableData>(result[0], SerializationSettings.Value);
+            var alive = JsonConvert.DeserializeObject<DateTime>(result[1], SerializationSettings.Value);
             data.Members[0].Item1.IAmAliveTime = alive;
             return data;
         }
@@ -151,7 +151,7 @@ namespace Orleans.Redis.Clustering.Messaging
                 throw;
             }
 
-            var version = new TableVersion(0, "");
+            var version = new TableVersion(0, "0");
             var memberMap = new Dictionary<string, Tuple<MembershipEntry, string>>();
             var aliveMap = new Dictionary<string, DateTime>();
             var deleteHashKeysList = new List<string>();
@@ -161,27 +161,23 @@ namespace Orleans.Redis.Clustering.Messaging
                 var resultJson = result.Value.ToString();
                 if (resultName.EndsWith("-data"))
                 {
-                    var member = JsonConvert.DeserializeObject<MembershipTableData>(resultJson, SerializationSettings.Value);
+                    var member =
+                        JsonConvert.DeserializeObject<MembershipTableData>(resultJson, SerializationSettings.Value);
+                    
                     if (version == null || member.Version.Version > version.Version)
                     {
-                        if (memberMap.Count > 0)
-                        {
-                            deleteHashKeysList.AddRange(memberMap.Keys.Select(m => $"{m}-data"));
-                            deleteHashKeysList.AddRange(memberMap.Keys.Select(m => $"{m}-alive"));
-                            memberMap.Clear();
-                        }
-
                         version = member.Version;
                     }
 
-                    if (member.Version.Version == version.Version)
-                    {
-                        memberMap[resultName.Substring(0, resultName.Length - "-data".Length)] = member.Members[0];
-                    }
-                    else
+                    if (member.Members[0].Item1.Status == SiloStatus.Dead)
                     {
                         deleteHashKeysList.Add($"{resultName}-data");
                         deleteHashKeysList.Add($"{resultName}-alive");
+                        deleteHashKeysList.Add($"{resultName}-etag");
+                    }
+                    else
+                    {
+                        memberMap[resultName.Substring(0, resultName.Length - "-data".Length)] = member.Members[0];
                     }
                 }
                 else if (resultName.EndsWith("-alive"))
@@ -195,7 +191,7 @@ namespace Orleans.Redis.Clustering.Messaging
             {
                 return new MembershipTableData(new List<Tuple<MembershipEntry, string>>(), version);
             }
-            
+
             foreach (var entry in memberMap)
             {
                 entry.Value.Item1.IAmAliveTime = aliveMap[$"{entry.Key}"];
@@ -222,7 +218,7 @@ namespace Orleans.Redis.Clustering.Messaging
             return new MembershipTableData(memberMap.Values.ToList(), version);
         }
 
-        public async Task<bool> InsertRow(MembershipEntry entry, TableVersion tableVersion)
+        public Task<bool> InsertRow(MembershipEntry entry, TableVersion tableVersion)
         {
             if (_logger.IsEnabled(LogLevel.Trace))
             {
@@ -230,53 +226,7 @@ namespace Orleans.Redis.Clustering.Messaging
                     $"RedisMembershipTable.InsertRow called with entry {entry} and tableVersion {tableVersion}.");
             }
 
-            if (entry == null)
-            {
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    _logger.Debug(
-                        "RedisMembershipTable.InsertRow aborted due to null check. MembershipEntry is null.");
-                }
-
-                throw new ArgumentNullException(nameof(entry));
-            }
-
-            if (tableVersion == null)
-            {
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    _logger.Debug("RedisMembershipTable.InsertRow aborted due to null check. TableVersion is null ");
-                }
-
-                throw new ArgumentNullException(nameof(tableVersion));
-            }
-
-            var hashKeyData = $"{entry.SiloAddress.ToParsableString()}-data";
-            var hashKeyAlive = $"{entry.SiloAddress.ToParsableString()}-alive";
-            var data = JsonConvert.SerializeObject(ConvertToMembershipTableData(new[]
-            {
-                new Tuple<MembershipEntry, int>(entry, tableVersion.Version)
-            }), SerializationSettings.Value);
-            var alive = JsonConvert.SerializeObject(entry.IAmAliveTime, SerializationSettings.Value);
-
-            try
-            {
-                await _db.HashSetAsync(_clusterKey, new[]
-                {
-                    new HashEntry(hashKeyData, data),
-                    new HashEntry(hashKeyAlive, alive)
-                });
-                return true;
-            }
-            catch (Exception ex)
-            {
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    _logger.Debug("RedisMembershipTable.InsertRow failed: {0}", ex);
-                }
-
-                throw;
-            }
+            return UpsertRow(entry, tableVersion, true, null);
         }
 
         public Task<bool> UpdateRow(MembershipEntry entry, string etag, TableVersion tableVersion)
@@ -287,7 +237,73 @@ namespace Orleans.Redis.Clustering.Messaging
                     $"RedisMembershipTable.UpdateRow called with entry {entry}, etag {etag} and tableVersion {tableVersion}.");
             }
 
-            return InsertRow(entry, tableVersion);
+            return UpsertRow(entry, tableVersion, false, etag);
+        }
+
+        private async Task<bool> UpsertRow(MembershipEntry entry, TableVersion tableVersion, bool insert,
+            string checkEtag)
+        {
+            if (_logger.IsEnabled(LogLevel.Trace))
+            {
+                _logger.Trace(
+                    $"RedisMembershipTable.UpsertRow called with entry {entry} and tableVersion {tableVersion}.");
+            }
+
+            if (entry == null)
+            {
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    _logger.Debug(
+                        "RedisMembershipTable.UpsertRow aborted due to null check. MembershipEntry is null.");
+                }
+
+                throw new ArgumentNullException(nameof(entry));
+            }
+
+            if (tableVersion == null)
+            {
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    _logger.Debug("RedisMembershipTable.UpsertRow aborted due to null check. TableVersion is null ");
+                }
+
+                throw new ArgumentNullException(nameof(tableVersion));
+            }
+
+            var hashKeyData = $"{entry.SiloAddress.ToParsableString()}-data";
+            var hashKeyAlive = $"{entry.SiloAddress.ToParsableString()}-alive";
+            var hashKeyEtag = $"{entry.SiloAddress.ToParsableString()}-etag";
+            var etag = Guid.NewGuid().ToString();
+            var mtd = new MembershipTableData(new Tuple<MembershipEntry, string>(entry, etag), tableVersion);
+            var data = JsonConvert.SerializeObject(mtd, SerializationSettings.Value);
+            var alive = JsonConvert.SerializeObject(entry.IAmAliveTime, SerializationSettings.Value);
+
+            try
+            {
+                var txn = _db.CreateTransaction();
+// async calls in Redis Transaction do not have to be awaited
+#pragma warning disable 4014
+                txn.AddCondition(insert
+                    ? Condition.HashNotExists(_clusterKey, hashKeyData)
+                    : Condition.HashEqual(_clusterKey, hashKeyEtag, checkEtag));
+                txn.HashSetAsync(_clusterKey, new[]
+                {
+                    new HashEntry(hashKeyData, data),
+                    new HashEntry(hashKeyAlive, alive),
+                    new HashEntry(hashKeyEtag, etag)
+                });
+#pragma warning restore 4014
+                return await txn.ExecuteAsync();
+            }
+            catch (Exception ex)
+            {
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    _logger.Debug("RedisMembershipTable.UpsertRow failed: {0}", ex);
+                }
+
+                throw;
+            }
         }
 
         public async Task UpdateIAmAlive(MembershipEntry entry)
@@ -315,21 +331,6 @@ namespace Orleans.Redis.Clustering.Messaging
 
                 throw;
             }
-        }
-
-        private static MembershipTableData ConvertToMembershipTableData(IEnumerable<Tuple<MembershipEntry, int>> ret)
-        {
-            var retList = ret.ToList();
-            var tableVersionEtag = retList[0].Item2;
-            var membershipEntries = new List<Tuple<MembershipEntry, string>>();
-            if (retList[0].Item1 != null)
-            {
-                membershipEntries.AddRange(
-                    retList.Select(i => new Tuple<MembershipEntry, string>(i.Item1, string.Empty)));
-            }
-
-            return new MembershipTableData(membershipEntries,
-                new TableVersion(tableVersionEtag, tableVersionEtag.ToString()));
         }
     }
 }
