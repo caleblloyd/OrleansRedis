@@ -17,6 +17,8 @@ namespace Orleans.Redis.Clustering.Messaging
 {
     public class RedisMembershipTable : IMembershipTable
     {
+        private static readonly TableVersion DefaultTableVersion = new TableVersion(0, "0");
+
         private readonly RedisKey _clusterKey;
         private readonly IOptions<RedisClusteringSiloOptions> _clusteringOptions;
         private readonly IDatabase _db;
@@ -27,7 +29,6 @@ namespace Orleans.Redis.Clustering.Messaging
             {
                 var settings = new JsonSerializerSettings();
                 settings.Converters.Add(new MembershipEntryConverter());
-                settings.Converters.Add(new MembershipTableDataConverter());
                 settings.Converters.Add(new TableVersionConverter());
                 settings.Converters.Add(new SiloAddressConverter());
                 settings.Converters.Add(new StringEnumConverter());
@@ -100,7 +101,8 @@ namespace Orleans.Redis.Clustering.Messaging
 
             var hashKeyData = $"{key.ToParsableString()}-data";
             var hashKeyAlive = $"{key.ToParsableString()}-alive";
-            RedisValue[] redisFields = {hashKeyData, hashKeyAlive};
+            var hashKeyEtag = $"{key.ToParsableString()}-etag";
+            RedisValue[] redisFields = {hashKeyData, hashKeyAlive, hashKeyEtag};
             RedisValue[] result;
             try
             {
@@ -116,15 +118,16 @@ namespace Orleans.Redis.Clustering.Messaging
                 throw;
             }
 
-            if (string.IsNullOrEmpty(result[0]) || string.IsNullOrEmpty(result[1]))
+            if (string.IsNullOrEmpty(result[0]) || string.IsNullOrEmpty(result[1]) || string.IsNullOrEmpty(result[2]))
             {
                 return null;
             }
 
-            var data = JsonConvert.DeserializeObject<MembershipTableData>(result[0], SerializationSettings.Value);
+            var data = JsonConvert.DeserializeObject<MembershipEntry>(result[0], SerializationSettings.Value);
             var alive = JsonConvert.DeserializeObject<DateTime>(result[1], SerializationSettings.Value);
-            data.Members[0].Item1.IAmAliveTime = alive;
-            return data;
+            var etag = result[2].ToString();
+            data.IAmAliveTime = alive;
+            return new MembershipTableData(new Tuple<MembershipEntry, string>(data, etag), DefaultTableVersion);
         }
 
         public Task<MembershipTableData> ReadAll() => ReadAll(_clusterKey, _db, _logger);
@@ -151,25 +154,20 @@ namespace Orleans.Redis.Clustering.Messaging
                 throw;
             }
 
-            var version = new TableVersion(0, "0");
-            var memberMap = new Dictionary<string, Tuple<MembershipEntry, string>>();
+            var entryMap = new Dictionary<string, MembershipEntry>();
             var aliveMap = new Dictionary<string, DateTime>();
+            var etagMap = new Dictionary<string, string>();
             var deleteHashKeysList = new List<string>();
             foreach (var result in results)
             {
                 var resultName = result.Name.ToString();
-                var resultJson = result.Value.ToString();
+                var resultValue = result.Value.ToString();
                 if (resultName.EndsWith("-data"))
                 {
-                    var member =
-                        JsonConvert.DeserializeObject<MembershipTableData>(resultJson, SerializationSettings.Value);
-                    
-                    if (version == null || member.Version.Version > version.Version)
-                    {
-                        version = member.Version;
-                    }
+                    var entry =
+                        JsonConvert.DeserializeObject<MembershipEntry>(resultValue, SerializationSettings.Value);
 
-                    if (member.Members[0].Item1.Status == SiloStatus.Dead)
+                    if (entry.Status == SiloStatus.Dead)
                     {
                         deleteHashKeysList.Add($"{resultName}-data");
                         deleteHashKeysList.Add($"{resultName}-alive");
@@ -177,24 +175,25 @@ namespace Orleans.Redis.Clustering.Messaging
                     }
                     else
                     {
-                        memberMap[resultName.Substring(0, resultName.Length - "-data".Length)] = member.Members[0];
+                        entryMap[resultName.Substring(0, resultName.Length - "-data".Length)] = entry;
                     }
                 }
                 else if (resultName.EndsWith("-alive"))
                 {
-                    var alive = JsonConvert.DeserializeObject<DateTime>(resultJson, SerializationSettings.Value);
+                    var alive = JsonConvert.DeserializeObject<DateTime>(resultValue, SerializationSettings.Value);
                     aliveMap[resultName.Substring(0, resultName.Length - "-alive".Length)] = alive;
+                }
+                else if (resultName.EndsWith("-etag"))
+                {
+                    etagMap[resultName.Substring(0, resultName.Length - "-etag".Length)] = resultValue;
                 }
             }
 
-            if (memberMap.Count == 0)
+            var members = new List<Tuple<MembershipEntry, string>>();
+            foreach (var el in entryMap)
             {
-                return new MembershipTableData(new List<Tuple<MembershipEntry, string>>(), version);
-            }
-
-            foreach (var entry in memberMap)
-            {
-                entry.Value.Item1.IAmAliveTime = aliveMap[$"{entry.Key}"];
+                el.Value.IAmAliveTime = aliveMap[$"{el.Key}"];
+                members.Add(new Tuple<MembershipEntry, string>(el.Value, etagMap[$"{el.Key}"]));
             }
 
             if (deleteHashKeysList.Count > 0)
@@ -215,7 +214,7 @@ namespace Orleans.Redis.Clustering.Messaging
                 }
             }
 
-            return new MembershipTableData(memberMap.Values.ToList(), version);
+            return new MembershipTableData(members, DefaultTableVersion);
         }
 
         public Task<bool> InsertRow(MembershipEntry entry, TableVersion tableVersion)
@@ -273,10 +272,9 @@ namespace Orleans.Redis.Clustering.Messaging
             var hashKeyData = $"{entry.SiloAddress.ToParsableString()}-data";
             var hashKeyAlive = $"{entry.SiloAddress.ToParsableString()}-alive";
             var hashKeyEtag = $"{entry.SiloAddress.ToParsableString()}-etag";
-            var etag = Guid.NewGuid().ToString();
-            var mtd = new MembershipTableData(new Tuple<MembershipEntry, string>(entry, etag), tableVersion);
-            var data = JsonConvert.SerializeObject(mtd, SerializationSettings.Value);
+            var data = JsonConvert.SerializeObject(entry, SerializationSettings.Value);
             var alive = JsonConvert.SerializeObject(entry.IAmAliveTime, SerializationSettings.Value);
+            var etag = Guid.NewGuid().ToString();
 
             try
             {
