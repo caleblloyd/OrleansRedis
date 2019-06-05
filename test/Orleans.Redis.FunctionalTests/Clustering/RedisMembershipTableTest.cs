@@ -57,37 +57,37 @@ namespace Orleans.Redis.FunctionalTests.Clustering
         [Fact]
         public async Task MembershipTable_Redis_InsertRow()
         {
-            await MembershipTable_InsertRow(false);
+            await MembershipTable_InsertRow();
         }
 
         [Fact]
         public async Task MembershipTable_Redis_ReadRow_Insert_Read()
         {
-            await MembershipTable_ReadRow_Insert_Read(false);
+            await MembershipTable_ReadRow_Insert_Read();
         }
 
         [Fact]
         public async Task MembershipTable_Redis_ReadAll_Insert_ReadAll()
         {
-            await MembershipTable_ReadAll_Insert_ReadAll(false);
+            await MembershipTable_ReadAll_Insert_ReadAll();
         }
 
         [Fact]
         public async Task MembershipTable_Redis_UpdateRow()
         {
-            await MembershipTable_UpdateRow(false);
+            await MembershipTable_UpdateRow();
         }
 
         [Fact]
         public async Task MembershipTable_Redis_UpdateRowInParallel()
         {
-            await MembershipTable_UpdateRowInParallel(false);
+            await MembershipTable_UpdateRowInParallel();
         }
 
         [Fact]
         public async Task MembershipTable_Redis_UpdateIAmAlive()
         {
-            await MembershipTable_UpdateIAmAlive(false);
+            await MembershipTable_UpdateIAmAlive();
         }
     }
 }
