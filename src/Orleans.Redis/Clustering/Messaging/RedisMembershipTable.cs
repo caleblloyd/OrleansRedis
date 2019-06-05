@@ -5,26 +5,43 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Converters;
 using Orleans.Configuration;
+using Orleans.Redis.Clustering.Options;
+using Orleans.Redis.Serialization;
 using Orleans.Runtime;
+using Orleans.Serialization;
 using StackExchange.Redis;
 
 namespace Orleans.Redis.Clustering.Messaging
 {
-    public class RedisClusteringTable : IMembershipTable
+    public class RedisMembershipTable : IMembershipTable
     {
+        private readonly RedisKey _clusterKey;
+        private readonly IOptions<RedisClusteringSiloOptions> _clusteringOptions;
         private readonly IDatabase _db;
-        private readonly string _clusterId;
-        private readonly ILogger<RedisClusteringTable> _logger;
+        private readonly ILogger<RedisMembershipTable> _logger;
+        
+        private static readonly Lazy<JsonSerializerSettings> SerializationSettings = new Lazy<JsonSerializerSettings>(() =>
+        {
+            var settings = new JsonSerializerSettings();
+            settings.Converters.Add(new SiloAddressConverter());
+            settings.Converters.Add(new MembershipEntryConverter());
+            settings.Converters.Add(new MembershipTableDataConverter());
+            settings.Converters.Add(new StringEnumConverter());
+            return settings;
+        });
 
-        public RedisClusteringTable(
-            IConnectionMultiplexer connectionMultiplexer,
+        public RedisMembershipTable(
             IOptions<ClusterOptions> clusterOptions,
-            ILogger<RedisClusteringTable> logger
+            IOptions<RedisClusteringSiloOptions> clusteringOptions,
+            IConnectionMultiplexer connectionMultiplexer,
+            ILogger<RedisMembershipTable> logger
         )
         {
-            _db = connectionMultiplexer.GetDatabase();
-            _clusterId = clusterOptions.Value.ClusterId;
+            _clusterKey = (RedisKey) $"${clusteringOptions.Value.KeyPrefix}${clusterOptions.Value.ClusterId}";
+            _clusteringOptions = clusteringOptions;
+            _db = connectionMultiplexer.GetDatabase(clusteringOptions.Value.Database);
             _logger = logger;
         }
 
@@ -32,7 +49,7 @@ namespace Orleans.Redis.Clustering.Messaging
         {
             if (_logger.IsEnabled(LogLevel.Trace))
             {
-                _logger.Trace("RedisClusteringTable.InitializeMembershipTable called.");
+                _logger.Trace("RedisMembershipTable.InitializeMembershipTable called.");
             }
 
             return Task.CompletedTask;
@@ -40,21 +57,22 @@ namespace Orleans.Redis.Clustering.Messaging
 
         public async Task DeleteMembershipTableEntries(string clusterId)
         {
+            var clusterKey = (RedisKey) $"${_clusteringOptions.Value.KeyPrefix}${clusterId}";
             if (_logger.IsEnabled(LogLevel.Trace))
             {
                 _logger.Trace(
-                    $"RedisClusteringTable.DeleteMembershipTableEntries called with clusterId {clusterId}.");
+                    $"RedisMembershipTable.DeleteMembershipTableEntries called with clusterId {clusterId}.");
             }
 
             try
             {
-                await _db.KeyDeleteAsync((RedisKey) _clusterId);
+                await _db.KeyDeleteAsync(clusterKey);
             }
             catch (Exception ex)
             {
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
-                    _logger.Debug("RedisClusteringTable.DeleteMembershipTableEntries failed: {0}", ex);
+                    _logger.Debug("RedisMembershipTable.DeleteMembershipTableEntries failed: {0}", ex);
                 }
 
                 throw;
@@ -65,7 +83,7 @@ namespace Orleans.Redis.Clustering.Messaging
         {
             if (_logger.IsEnabled(LogLevel.Trace))
             {
-                _logger.Trace("RedisClusteringTable.CleanupDefunctSiloEntries called.");
+                _logger.Trace("RedisMembershipTable.CleanupDefunctSiloEntries called.");
             }
 
             throw new NotImplementedException();
@@ -75,7 +93,7 @@ namespace Orleans.Redis.Clustering.Messaging
         {
             if (_logger.IsEnabled(LogLevel.Trace))
             {
-                _logger.Trace($"RedisClusteringTable.ReadRow called with key: {key}.");
+                _logger.Trace($"RedisMembershipTable.ReadRow called with key: {key}.");
             }
 
             var hashKeyData = $"{key.ToParsableString()}-data";
@@ -84,13 +102,13 @@ namespace Orleans.Redis.Clustering.Messaging
             RedisValue[] result;
             try
             {
-                result = await _db.HashGetAsync((RedisKey) _clusterId, redisFields);
+                result = await _db.HashGetAsync(_clusterKey, redisFields);
             }
             catch (Exception ex)
             {
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
-                    _logger.Debug("RedisClusteringTable.ReadRow failed: {0}", ex);
+                    _logger.Debug("RedisMembershipTable.ReadRow failed: {0}", ex);
                 }
 
                 throw;
@@ -103,35 +121,37 @@ namespace Orleans.Redis.Clustering.Messaging
                 return null;
             }
 
-            var alive = JsonConvert.DeserializeObject<DateTime>(result[0].ToString());
-            var data = JsonConvert.DeserializeObject<MembershipTableData>(result[1].ToString());
+            var alive = JsonConvert.DeserializeObject<DateTime>(result[0].ToString(), SerializationSettings.Value);
+            var data = JsonConvert.DeserializeObject<MembershipTableData>(result[1].ToString(), SerializationSettings.Value);
             data.Members[0].Item1.IAmAliveTime = alive;
             return data;
         }
 
-        public async Task<MembershipTableData> ReadAll()
+        public Task<MembershipTableData> ReadAll() => ReadAll(_clusterKey, _db, _logger);
+
+        internal static async Task<MembershipTableData> ReadAll(RedisKey clusterKey, IDatabase db, ILogger logger)
         {
-            if (_logger.IsEnabled(LogLevel.Trace))
+            if (logger.IsEnabled(LogLevel.Trace))
             {
-                _logger.Trace("RedisClusteringTable.ReadAll called.");
+                logger.Trace("RedisMembershipTable.ReadAll called.");
             }
 
             HashEntry[] results;
             try
             {
-                results = await _db.HashGetAllAsync((RedisKey) _clusterId);
+                results = await db.HashGetAllAsync(clusterKey);
             }
             catch (Exception ex)
             {
-                if (_logger.IsEnabled(LogLevel.Debug))
+                if (logger.IsEnabled(LogLevel.Debug))
                 {
-                    _logger.Debug("RedisClusteringTable.ReadAll failed: {0}", ex);
+                    logger.Debug("RedisMembershipTable.ReadAll failed: {0}", ex);
                 }
 
                 throw;
             }
 
-            TableVersion version = null;
+            var version = new TableVersion(0, "");
             var memberMap = new Dictionary<string, Tuple<MembershipEntry, string>>();
             var aliveMap = new Dictionary<string, DateTime>();
             var deleteHashKeysList = new List<string>();
@@ -141,7 +161,7 @@ namespace Orleans.Redis.Clustering.Messaging
                 var resultJson = result.Value.ToString();
                 if (resultName.EndsWith("-data"))
                 {
-                    var member = JsonConvert.DeserializeObject<MembershipTableData>(resultJson);
+                    var member = JsonConvert.DeserializeObject<MembershipTableData>(resultJson, SerializationSettings.Value);
                     if (version == null || member.Version.Version > version.Version)
                     {
                         if (memberMap.Count > 0)
@@ -156,7 +176,7 @@ namespace Orleans.Redis.Clustering.Messaging
 
                     if (member.Version.Version == version.Version)
                     {
-                        memberMap[resultName.Substring(0, "-data".Length)] = member.Members[0];
+                        memberMap[resultName.Substring(0, resultName.Length - "-data".Length)] = member.Members[0];
                     }
                     else
                     {
@@ -166,19 +186,19 @@ namespace Orleans.Redis.Clustering.Messaging
                 }
                 else if (resultName.EndsWith("-alive"))
                 {
-                    var alive = JsonConvert.DeserializeObject<DateTime>(resultJson);
-                    aliveMap[resultName.Substring(0, "-alive".Length)] = alive;
+                    var alive = JsonConvert.DeserializeObject<DateTime>(resultJson, SerializationSettings.Value);
+                    aliveMap[resultName.Substring(0, resultName.Length - "-alive".Length)] = alive;
                 }
             }
 
             if (memberMap.Count == 0)
             {
-                return null;
+                return new MembershipTableData(new List<Tuple<MembershipEntry, string>>(), version);
             }
-
+            
             foreach (var entry in memberMap)
             {
-                entry.Value.Item1.IAmAliveTime = aliveMap[$"{entry.Key}-alive"];
+                entry.Value.Item1.IAmAliveTime = aliveMap[$"{entry.Key}"];
             }
 
             if (deleteHashKeysList.Count > 0)
@@ -186,13 +206,13 @@ namespace Orleans.Redis.Clustering.Messaging
                 try
                 {
                     var deleteHashKeys = deleteHashKeysList.Select(m => (RedisValue) m).ToArray();
-                    await _db.HashDeleteAsync(_clusterId, deleteHashKeys);
+                    await db.HashDeleteAsync(clusterKey, deleteHashKeys);
                 }
                 catch (Exception ex)
                 {
-                    if (_logger.IsEnabled(LogLevel.Debug))
+                    if (logger.IsEnabled(LogLevel.Debug))
                     {
-                        _logger.Debug("RedisClusteringTable.ReadAll failed to delete stale hash keys: {0}", ex);
+                        logger.Debug("RedisMembershipTable.ReadAll failed to delete stale hash keys: {0}", ex);
                     }
 
                     throw;
@@ -207,7 +227,7 @@ namespace Orleans.Redis.Clustering.Messaging
             if (_logger.IsEnabled(LogLevel.Trace))
             {
                 _logger.Trace(
-                    $"RedisClusteringTable.InsertRow called with entry {entry} and tableVersion {tableVersion}.");
+                    $"RedisMembershipTable.InsertRow called with entry {entry} and tableVersion {tableVersion}.");
             }
 
             if (entry == null)
@@ -215,7 +235,7 @@ namespace Orleans.Redis.Clustering.Messaging
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
                     _logger.Debug(
-                        "RedisClusteringTable.InsertRow aborted due to null check. MembershipEntry is null.");
+                        "RedisMembershipTable.InsertRow aborted due to null check. MembershipEntry is null.");
                 }
 
                 throw new ArgumentNullException(nameof(entry));
@@ -225,7 +245,7 @@ namespace Orleans.Redis.Clustering.Messaging
             {
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
-                    _logger.Debug("RedisClusteringTable.InsertRow aborted due to null check. TableVersion is null ");
+                    _logger.Debug("RedisMembershipTable.InsertRow aborted due to null check. TableVersion is null ");
                 }
 
                 throw new ArgumentNullException(nameof(tableVersion));
@@ -236,12 +256,12 @@ namespace Orleans.Redis.Clustering.Messaging
             var data = JsonConvert.SerializeObject(ConvertToMembershipTableData(new[]
             {
                 new Tuple<MembershipEntry, int>(entry, tableVersion.Version)
-            }));
-            var alive = JsonConvert.SerializeObject(entry.IAmAliveTime);
+            }), SerializationSettings.Value);
+            var alive = JsonConvert.SerializeObject(entry.IAmAliveTime, SerializationSettings.Value);
 
             try
             {
-                await _db.HashSetAsync(_clusterId, new[]
+                await _db.HashSetAsync(_clusterKey, new[]
                 {
                     new HashEntry(hashKeyData, data),
                     new HashEntry(hashKeyAlive, alive)
@@ -252,7 +272,7 @@ namespace Orleans.Redis.Clustering.Messaging
             {
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
-                    _logger.Debug("RedisClusteringTable.InsertRow failed: {0}", ex);
+                    _logger.Debug("RedisMembershipTable.InsertRow failed: {0}", ex);
                 }
 
                 throw;
@@ -264,7 +284,7 @@ namespace Orleans.Redis.Clustering.Messaging
             if (_logger.IsEnabled(LogLevel.Trace))
             {
                 _logger.Trace(
-                    $"RedisClusteringTable.UpdateRow called with entry {entry}, etag {etag} and tableVersion {tableVersion}.");
+                    $"RedisMembershipTable.UpdateRow called with entry {entry}, etag {etag} and tableVersion {tableVersion}.");
             }
 
             return InsertRow(entry, tableVersion);
@@ -274,14 +294,14 @@ namespace Orleans.Redis.Clustering.Messaging
         {
             if (_logger.IsEnabled(LogLevel.Trace))
             {
-                _logger.Trace($"RedisClusteringTable.UpdateIAmAlive called with entry {entry}.");
+                _logger.Trace($"RedisMembershipTable.UpdateIAmAlive called with entry {entry}.");
             }
 
             var hashKeyAlive = $"{entry.SiloAddress.ToParsableString()}-alive";
-            var alive = JsonConvert.SerializeObject(entry.IAmAliveTime);
+            var alive = JsonConvert.SerializeObject(entry.IAmAliveTime, SerializationSettings.Value);
             try
             {
-                await _db.HashSetAsync(_clusterId, new[]
+                await _db.HashSetAsync(_clusterKey, new[]
                 {
                     new HashEntry(hashKeyAlive, alive)
                 });
@@ -290,7 +310,7 @@ namespace Orleans.Redis.Clustering.Messaging
             {
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
-                    _logger.Debug("RedisClusteringTable.InsertRow failed: {0}", ex);
+                    _logger.Debug("RedisMembershipTable.InsertRow failed: {0}", ex);
                 }
 
                 throw;
