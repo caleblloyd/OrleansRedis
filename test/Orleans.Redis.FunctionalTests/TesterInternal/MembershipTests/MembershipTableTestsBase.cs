@@ -45,8 +45,6 @@ namespace UnitTests.MembershipTests
 
         protected MembershipTableTestsBase(LoggerFilterOptions filters)
         {
-            connectionMultiplexer = ConnectionMultiplexer.Connect("localhost");
-
             loggerFactory = TestingUtils.CreateDefaultLoggerFactory($"{this.GetType()}.log", filters);
             logger = loggerFactory.CreateLogger(this.GetType().FullName);
 

@@ -1,9 +1,6 @@
 namespace Orleans.Redis.Clustering.Options
 {
-    public class RedisClusteringClientOptions
+    public class RedisClusteringClientOptions : RedisClusteringBaseOptions
     {
-        public int Database { get; set; } = -1;
-
-        public string KeyPrefix { get; set; } = "orleans-";
     }
 }

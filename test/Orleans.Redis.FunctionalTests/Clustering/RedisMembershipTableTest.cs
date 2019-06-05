@@ -30,15 +30,21 @@ namespace Orleans.Redis.FunctionalTests.Clustering
 
         protected override IMembershipTable CreateMembershipTable(ILogger logger)
         {
-            var options = new RedisClusteringSiloOptions();
-            return new RedisMembershipTable(clusterOptions, Options.Create(options), connectionMultiplexer,
+            var options = new RedisClusteringSiloOptions
+            {
+                Configuration = "localhost"
+            };
+            return new RedisMembershipTable(clusterOptions, Options.Create(options),
                 loggerFactory.CreateLogger<RedisMembershipTable>());
         }
 
         protected override IGatewayListProvider CreateGatewayListProvider(ILogger logger)
         {
-            var options = new RedisClusteringClientOptions();
-            return new RedisGatewayListProvider(clusterOptions, Options.Create(options), connectionMultiplexer,
+            var options = new RedisClusteringClientOptions
+            {
+                Configuration = "localhost"
+            };
+            return new RedisGatewayListProvider(clusterOptions, Options.Create(options),
                 gatewayOptions, loggerFactory.CreateLogger<RedisGatewayListProvider>());
         }
 

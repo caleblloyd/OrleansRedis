@@ -24,13 +24,12 @@ namespace Orleans.Redis.Clustering.Messaging
         public RedisGatewayListProvider(
             IOptions<ClusterOptions> clusterOptions,
             IOptions<RedisClusteringClientOptions> clusteringOptions,
-            IConnectionMultiplexer connectionMultiplexer,
             IOptions<GatewayOptions> gatewayOptions,
             ILogger<RedisGatewayListProvider> logger
         )
         {
             _clusterKey = (RedisKey) $"${clusteringOptions.Value.KeyPrefix}${clusterOptions.Value.ClusterId}";
-            _db = connectionMultiplexer.GetDatabase(clusteringOptions.Value.Database);
+            _db = clusteringOptions.Value.ConnectionMultiplexer.GetDatabase(clusteringOptions.Value.Database);
             _logger = logger;
             MaxStaleness = gatewayOptions.Value.GatewayListRefreshPeriod;
         }

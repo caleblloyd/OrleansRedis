@@ -38,13 +38,12 @@ namespace Orleans.Redis.Clustering.Messaging
         public RedisMembershipTable(
             IOptions<ClusterOptions> clusterOptions,
             IOptions<RedisClusteringSiloOptions> clusteringOptions,
-            IConnectionMultiplexer connectionMultiplexer,
             ILogger<RedisMembershipTable> logger
         )
         {
             _clusterKey = (RedisKey) $"${clusteringOptions.Value.KeyPrefix}${clusterOptions.Value.ClusterId}";
             _clusteringOptions = clusteringOptions;
-            _db = connectionMultiplexer.GetDatabase(clusteringOptions.Value.Database);
+            _db = clusteringOptions.Value.ConnectionMultiplexer.GetDatabase(clusteringOptions.Value.Database);
             _logger = logger;
         }
 
@@ -191,13 +190,14 @@ namespace Orleans.Redis.Clustering.Messaging
                 throw;
             }
 
-            if (results.Any(result => string.IsNullOrEmpty(result)))
+            var tableVersion = results[0].IsNull ? 0 : (int) results[0];
+            var tableVersionEtag = results[1].IsNull ? "" : (string) results[1];
+            if (results.Skip(2).Any(result => string.IsNullOrEmpty(result)))
             {
-                return null;
+                return new MembershipTableData(new List<Tuple<MembershipEntry, string>>(),
+                    new TableVersion(tableVersion, tableVersionEtag));
             }
 
-            var tableVersion = (int) results[0];
-            var tableVersionEtag = (string) results[1];
             var data = JsonConvert.DeserializeObject<MembershipEntry>(results[2], SerializationSettings.Value);
             var alive = JsonConvert.DeserializeObject<DateTime>(results[3], SerializationSettings.Value);
             var etag = (string) results[4];
